@@ -102,33 +102,56 @@ function slugify(s: string) {
     .slice(0, 48);
 }
 
-async function seedRoles() {
-  for (const p of PERMISSIONS) {
-    await prisma.permission.upsert({
-      where: { code: p },
-      create: { code: p, name: p },
-      update: {},
-    });
+async function withRetry<T>(fn: () => Promise<T>, tries = 4): Promise<T> {
+  let last: unknown;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      last = e;
+      await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+      try {
+        await prisma.$connect();
+      } catch {
+        /* ignore */
+      }
+    }
   }
-  await prisma.permission.upsert({
-    where: { code: '*' },
-    create: { code: '*', name: 'All permissions' },
-    update: {},
-  });
-  for (const r of ROLES) {
-    const role = await prisma.role.upsert({
-      where: { code: r.code },
-      create: r,
-      update: { name: r.name },
-    });
-    for (const code of ROLE_PERMS[r.code] || []) {
-      const perm = await prisma.permission.findUnique({ where: { code } });
-      if (!perm) continue;
-      await prisma.rolePermission.upsert({
-        where: { roleId_permissionId: { roleId: role.id, permissionId: perm.id } },
-        create: { roleId: role.id, permissionId: perm.id },
+  throw last;
+}
+
+async function seedRoles() {
+  for (const p of [...PERMISSIONS, '*']) {
+    await withRetry(() =>
+      prisma.permission.upsert({
+        where: { code: p },
+        create: { code: p, name: p === '*' ? 'All permissions' : p },
         update: {},
-      });
+      }),
+    );
+  }
+  const allPerms = await withRetry(() => prisma.permission.findMany());
+  const permByCode = new Map(allPerms.map((p) => [p.code, p]));
+
+  for (const r of ROLES) {
+    const role = await withRetry(() =>
+      prisma.role.upsert({
+        where: { code: r.code },
+        create: r,
+        update: { name: r.name },
+      }),
+    );
+    const codes = ROLE_PERMS[r.code] || [];
+    for (const code of codes) {
+      const perm = permByCode.get(code);
+      if (!perm) continue;
+      await withRetry(() =>
+        prisma.rolePermission.upsert({
+          where: { roleId_permissionId: { roleId: role.id, permissionId: perm.id } },
+          create: { roleId: role.id, permissionId: perm.id },
+          update: {},
+        }),
+      );
     }
   }
 }

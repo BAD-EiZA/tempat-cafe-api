@@ -1,0 +1,30 @@
+import { OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { OutboxService } from './outbox.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { OrdersService } from '../orders/orders.service';
+import { LedgerService } from '../ledger/ledger.service';
+import { RealtimeHub } from '../realtime/realtime.hub';
+export declare class OutboxWorker implements OnModuleInit, OnModuleDestroy {
+    private readonly outbox;
+    private readonly prisma;
+    private readonly notifications;
+    private readonly orders;
+    private readonly ledger;
+    private readonly realtime;
+    private readonly log;
+    private timer?;
+    private settleTimer?;
+    private reminderTimer?;
+    private running;
+    constructor(outbox: OutboxService, prisma: PrismaService, notifications: NotificationsService, orders: OrdersService, ledger: LedgerService, realtime: RealtimeHub);
+    onModuleInit(): void;
+    onModuleDestroy(): void;
+    processOnce(): Promise<void>;
+    private reservationReminders;
+    private tick;
+    private settle;
+    private expireUnpaid;
+    private processOutbox;
+    private handle;
+}

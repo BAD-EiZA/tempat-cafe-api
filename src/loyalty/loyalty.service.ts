@@ -5,6 +5,22 @@ import { PrismaService } from '../prisma/prisma.service';
 export class LoyaltyService {
   constructor(private readonly prisma: PrismaService) {}
 
+  async findCustomerByPhone(phone: string, organizationId: string) {
+    const normalized = phone.replace(/\D/g, '');
+    if (!normalized) return null;
+    const customers = await this.prisma.customer.findMany({
+      where: {
+        phone: { not: null },
+        OR: [
+          { profiles: { some: { organizationId } } },
+          { memberships: { some: { organizationId } } },
+          { loyaltyAccounts: { some: { organizationId } } },
+        ],
+      },
+    });
+    return customers.find((customer) => customer.phone?.replace(/\D/g, '') === normalized) || null;
+  }
+
   async earnForOrder(orderId: string) {
     const order = await this.prisma.order.findUnique({ where: { id: orderId } });
     if (!order?.customerId) return null;
@@ -103,17 +119,22 @@ export class LoyaltyService {
     });
   }
 
-  async restoreRedeem(orderId: string) {
-    const entries = await this.prisma.loyaltyLedgerEntry.findMany({
+  async restoreRedeem(orderId: string, tx?: any) {
+    const client = tx || this.prisma;
+    const restored = await client.loyaltyLedgerEntry.findMany({
+      where: { orderId, entryType: 'REDEEM_RESTORE' },
+    });
+    if (restored.length) return;
+    const entries = await client.loyaltyLedgerEntry.findMany({
       where: { orderId, entryType: 'REDEEM' },
     });
     for (const e of entries) {
       const pts = Math.abs(e.points);
-      await this.prisma.loyaltyAccount.update({
+      await client.loyaltyAccount.update({
         where: { id: e.accountId },
         data: { balance: { increment: pts } },
       });
-      await this.prisma.loyaltyLedgerEntry.create({
+      await client.loyaltyLedgerEntry.create({
         data: {
           accountId: e.accountId,
           entryType: 'REDEEM_RESTORE',

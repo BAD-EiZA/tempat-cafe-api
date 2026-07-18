@@ -1,12 +1,14 @@
 import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { CurrentUser, Public, RequirePermissions } from '../common/decorators';
 import { AuthUser } from '../common/types';
-import { pickOrgId } from '../common/tenant';
+import { assertOrgAccess, pickOrgId } from '../common/tenant';
 import { FeedbackService } from './feedback.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { NotFoundException } from '@nestjs/common';
 
 @Controller('feedback')
 export class FeedbackController {
-  constructor(private readonly service: FeedbackService) {}
+  constructor(private readonly service: FeedbackService, private readonly prisma: PrismaService) {}
 
   @Public()
   @Post()
@@ -33,11 +35,17 @@ export class FeedbackController {
 
   @Post(':id/respond')
   @RequirePermissions('feedback.respond')
-  respond(
+  async respond(
     @Param('id') id: string,
     @Body() body: { message: string },
     @CurrentUser() user: AuthUser,
   ) {
+    const feedback = await this.prisma.feedback.findUnique({
+      where: { id },
+      select: { order: { select: { organizationId: true } } },
+    });
+    if (!feedback) throw new NotFoundException('Feedback not found');
+    assertOrgAccess(user, feedback.order.organizationId);
     return this.service.respond(id, body.message, user.id);
   }
 }

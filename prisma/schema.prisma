@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x", "rhel-openssl-1.0.x"]
 }
 
 datasource db {
@@ -56,6 +57,7 @@ model Organization {
   customers        CustomerMerchantProfile[]
   membershipTiers  MembershipTier[]
   loyaltyRules     LoyaltyRule[]
+  modifierGroups   ModifierGroup[]
   vouchers         Voucher[]
   promotions       Promotion[]
   feeRules         FeeRule[]
@@ -419,12 +421,14 @@ model VariantOption {
 }
 
 model ModifierGroup {
-  id        String  @id @default(uuid()) @db.Uuid
-  name      String
-  required  Boolean @default(false)
-  minSelect Int     @default(0) @map("min_select")
-  maxSelect Int     @default(1) @map("max_select")
+  id             String  @id @default(uuid()) @db.Uuid
+  organizationId String? @map("organization_id") @db.Uuid
+  name           String
+  required       Boolean @default(false)
+  minSelect      Int     @default(0) @map("min_select")
+  maxSelect      Int     @default(1) @map("max_select")
 
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   modifiers Modifier[]
   itemLinks MenuItemModifierGroup[]
 
@@ -1029,6 +1033,7 @@ model KitchenTicket {
   printJobs PrintJob[]
 
   @@index([branchId, status])
+  @@unique([orderId, stationId])
   @@map("kitchen_tickets")
 }
 

@@ -1,5 +1,5 @@
-import { Controller, MessageEvent, Query, Sse, UnauthorizedException } from '@nestjs/common';
-import { map, Observable } from 'rxjs';
+import { BadRequestException, Controller, MessageEvent, NotFoundException, Query, Sse, UnauthorizedException } from '@nestjs/common';
+import { filter, map, Observable } from 'rxjs';
 import { Public } from '../common/decorators';
 import { RealtimeHub } from './realtime.hub';
 import { PrismaService } from '../prisma/prisma.service';
@@ -41,14 +41,17 @@ export class RealtimeController {
 
   @Public()
   @Sse('order')
-  orderTrack(@Query('publicToken') publicToken?: string): Observable<MessageEvent> {
+  async orderTrack(@Query('publicToken') publicToken?: string): Promise<Observable<MessageEvent>> {
+    if (!publicToken) throw new BadRequestException('publicToken required');
+    const order = await this.prisma.order.findUnique({
+      where: { publicToken },
+      select: { id: true },
+    });
+    if (!order) throw new NotFoundException('Order not found');
+
     return this.hub.stream().pipe(
-      map((e) => {
-        if (publicToken && e.payload?.publicToken && e.payload.publicToken !== publicToken) {
-          return null as any;
-        }
-        return { data: e as any, type: e.type, id: e.at };
-      }),
+      filter((e) => e.payload?.orderId === order.id),
+      map((e) => ({ data: e as any, type: e.type, id: e.at })),
     );
   }
 }

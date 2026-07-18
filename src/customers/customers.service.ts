@@ -68,13 +68,13 @@ export class CustomersService {
     });
   }
 
-  get(id: string) {
-    return this.prisma.customer.findUnique({
-      where: { id },
+  get(id: string, organizationId: string) {
+    return this.prisma.customer.findFirst({
+      where: { id, profiles: { some: { organizationId } } },
       include: {
-        memberships: { include: { tier: true } },
-        loyaltyAccounts: true,
-        orders: { take: 20, orderBy: { createdAt: 'desc' } },
+        memberships: { where: { organizationId }, include: { tier: true } },
+        loyaltyAccounts: { where: { organizationId } },
+        orders: { where: { organizationId }, take: 20, orderBy: { createdAt: 'desc' } },
       },
     });
   }

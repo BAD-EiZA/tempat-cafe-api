@@ -14,6 +14,8 @@ import { LedgerService } from '../ledger/ledger.service';
 import { ConfigService } from '@nestjs/config';
 import { AuthUser } from '../common/types';
 import { assertOrgAccess, isPlatformAdmin } from '../common/tenant';
+import { paymentAmountMatches } from './transaction-security';
+import { isValidRefundAmount } from '../common/transaction-integrity';
 
 @Injectable()
 export class PaymentsService {
@@ -189,6 +191,39 @@ export class PaymentsService {
       return { ok: true, alreadyPaid: true };
     }
 
+    if (mapped === 'PAID') {
+      const gross = Number(payload.gross_amount);
+      if (!paymentAmountMatches(payload.gross_amount, payment.amount)) {
+        await this.prisma.reconciliationRecord.create({
+          data: {
+            paymentId: payment.id,
+            status: 'AMOUNT_mismatch',
+            internalAmount: payment.amount,
+            providerAmount: Number.isFinite(gross) ? Math.round(gross) : 0,
+            providerTxId: payload.transaction_id,
+            notes: 'gross_amount != payment.amount',
+          },
+        }).catch(() => undefined);
+        await this.prisma.payment.update({
+          where: { id: payment.id },
+          data: {
+            status: 'ERROR',
+            providerTxId: payload.transaction_id || payment.providerTxId,
+            method: payload.payment_type,
+          },
+        });
+        const order = await this.prisma.order.findUnique({ where: { id: payment.orderId } });
+        if (order?.status === 'AWAITING_PAYMENT') {
+          await this.orders.updateStatus(order.id, 'PAYMENT_REVIEW', undefined, 'gross_amount_mismatch');
+        }
+        await this.prisma.paymentEvent.updateMany({
+          where: { fingerprint },
+          data: { processedAt: new Date(), status: 'PROCESSED' },
+        });
+        return { ok: true, status: 'PAYMENT_REVIEW' };
+      }
+    }
+
     await this.prisma.payment.update({
       where: { id: payment.id },
       data: {
@@ -200,22 +235,13 @@ export class PaymentsService {
     });
 
     if (mapped === 'PAID') {
-      const expected = payment.amount;
-      const gross = Math.round(Number(payload.gross_amount || expected));
-      if (gross !== expected) {
-        await this.prisma.reconciliationRecord.create({
-          data: {
-            paymentId: payment.id,
-            status: 'AMOUNT_mismatch',
-            internalAmount: expected,
-            providerAmount: gross,
-            providerTxId: payload.transaction_id,
-            notes: 'gross_amount != payment.amount',
-          },
-        }).catch(() => undefined);
-      }
       await this.orders.markPaid(payment.orderId);
       await this.ledger.postSale(payment.id);
+    } else if (mapped === 'EXPIRED' || mapped === 'CANCELLED') {
+      const order = await this.prisma.order.findUnique({ where: { id: payment.orderId } });
+      if (order?.status === 'AWAITING_PAYMENT') {
+        await this.orders.updateStatus(order.id, 'CANCELLED', undefined, `payment_${mapped.toLowerCase()}`);
+      }
     }
 
     await this.prisma.paymentEvent.updateMany({
@@ -293,25 +319,33 @@ export class PaymentsService {
   }
 
   async requestRefund(paymentId: string, amount: number, reason: string, userId: string, idempotencyKey: string) {
-    const payment = await this.prisma.payment.findUnique({ where: { id: paymentId } });
-    if (!payment || payment.status !== 'PAID' && payment.status !== 'PARTIALLY_REFUNDED') {
-      throw new BadRequestException('Payment not refundable');
-    }
-    const existing = await this.prisma.refund.findUnique({ where: { idempotencyKey } });
-    if (existing) return existing;
-
-    if (amount > payment.amount) throw new BadRequestException('Amount exceeds paid');
-
-    const refund = await this.prisma.refund.create({
-      data: {
-        paymentId,
-        amount,
-        reason,
-        status: 'PENDING',
-        idempotencyKey,
-        requestedBy: userId,
-      },
+    if (!isValidRefundAmount(amount)) throw new BadRequestException('Amount must be a positive integer');
+    const result = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.refund.findUnique({ where: { idempotencyKey } });
+      if (existing) return { refund: existing, created: false };
+      const rows = await tx.$queryRaw<{ amount: number; status: string; provider_order_id: string | null }[]>`
+        SELECT amount, status, provider_order_id FROM payments WHERE id = ${paymentId}::uuid FOR UPDATE
+      `;
+      const payment = rows[0];
+      if (!payment || !['PAID', 'PARTIALLY_REFUNDED'].includes(payment.status)) {
+        throw new BadRequestException('Payment not refundable');
+      }
+      const aggregate = await tx.refund.aggregate({
+        where: { paymentId, status: { in: ['PENDING', 'COMPLETED'] } },
+        _sum: { amount: true },
+      });
+      if (amount > payment.amount - (aggregate._sum.amount || 0)) {
+        throw new BadRequestException('Amount exceeds refundable balance');
+      }
+      const refund = await tx.refund.create({
+        data: { paymentId, amount, reason, status: 'PENDING', idempotencyKey, requestedBy: userId },
+      });
+      return { refund, created: true };
     });
+
+    const { refund } = result;
+    if (!result.created) return refund;
+    const payment = await this.prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
 
     if (this.midtrans.isEnabled && payment.providerOrderId) {
       try {
@@ -325,15 +359,15 @@ export class PaymentsService {
       }
     }
 
-    await this.prisma.refund.update({
-      where: { id: refund.id },
-      data: { status: 'COMPLETED' },
-    });
-    await this.prisma.payment.update({
-      where: { id: paymentId },
-      data: {
-        status: amount >= payment.amount ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
-      },
+    await this.prisma.$transaction(async (tx) => {
+      await tx.refund.update({ where: { id: refund.id }, data: { status: 'COMPLETED' } });
+      const completed = await tx.refund.aggregate({
+        where: { paymentId, status: 'COMPLETED' }, _sum: { amount: true },
+      });
+      await tx.payment.update({
+        where: { id: paymentId },
+        data: { status: (completed._sum.amount || 0) >= payment.amount ? 'REFUNDED' : 'PARTIALLY_REFUNDED' },
+      });
     });
     await this.ledger.postRefund(paymentId, amount, refund.id);
     return refund;

@@ -5,7 +5,7 @@ import {
   Inject,
   forwardRef,
 } from '@nestjs/common';
-import { OrderStatus, Prisma } from '@prisma/client';
+import { OrderStatus, OrderType, Prisma } from '@prisma/client';
 import { randomBytes } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { PricingService } from '../pricing/pricing.service';
@@ -16,6 +16,7 @@ import { PromotionsService } from '../promotions/promotions.service';
 import { TipsService } from '../tips/tips.service';
 import { LoyaltyService } from '../loyalty/loyalty.service';
 import { PaymentsService } from '../payments/payments.service';
+import { checkoutInputError } from '../common/transaction-integrity';
 
 const ORDER_TRANSITIONS: Record<string, OrderStatus[]> = {
   DRAFT: ['AWAITING_PAYMENT', 'NEW', 'CANCELLED'],
@@ -75,11 +76,12 @@ export class OrdersService {
       menuItemId: string;
       quantity: number;
       notes?: string;
-      modifiers?: { name: string; priceDelta: number }[];
+      modifiers?: { modifierId: string }[];
     }[];
-    skipPayment?: boolean;
-  }) {
+  }, options: { skipPayment?: boolean } = {}) {
     if (!dto.idempotencyKey) throw new BadRequestException('idempotencyKey required');
+    const inputError = checkoutInputError(dto);
+    if (inputError) throw new BadRequestException(inputError);
 
     const existing = await this.prisma.order.findUnique({
       where: { idempotencyKey: dto.idempotencyKey },
@@ -89,27 +91,54 @@ export class OrdersService {
 
     const branch = await this.prisma.branch.findUnique({ where: { id: dto.branchId } });
     if (!branch) throw new NotFoundException('Branch not found');
+    if (branch.status !== 'ACTIVE') throw new BadRequestException('Branch inactive');
 
     const menuItems = await this.prisma.menuItem.findMany({
       where: { id: { in: dto.items.map((i) => i.menuItemId) } },
-      include: { branchItems: { where: { branchId: dto.branchId } } },
+      include: {
+        branchItems: { where: { branchId: dto.branchId } },
+        category: { include: { menu: true } },
+      },
     });
     const map = new Map(menuItems.map((m) => [m.id, m]));
+    const modifierIds = dto.items.flatMap((i) => (i.modifiers || []).map((m) => m.modifierId));
+    const modifiers = await this.prisma.modifier.findMany({
+      where: { id: { in: modifierIds } },
+      include: { group: { include: { itemLinks: true } } },
+    });
+    const modifierMap = new Map(modifiers.map((m) => [m.id, m]));
 
     const lines = dto.items.map((i) => {
       const mi = map.get(i.menuItemId);
       if (!mi) throw new BadRequestException(`Item ${i.menuItemId} not found`);
+      if (
+        !mi.isActive || mi.deletedAt || !mi.category.isActive || !mi.category.menu.isActive ||
+        mi.category.menu.brandId !== branch.brandId ||
+        (mi.category.menu.branchId && mi.category.menu.branchId !== branch.id)
+      ) {
+        throw new BadRequestException(`${mi.name} unavailable`);
+      }
+      if (mi.maxPerOrder != null && i.quantity > mi.maxPerOrder) {
+        throw new BadRequestException(`${mi.name} exceeds maximum quantity`);
+      }
       const ov = mi.branchItems[0];
       if (ov?.isSoldOut || ov?.isAvailable === false) {
         throw new BadRequestException(`${mi.name} unavailable`);
       }
+      const resolvedModifiers = (i.modifiers || []).map(({ modifierId }) => {
+        const modifier = modifierMap.get(modifierId);
+        if (!modifier || !modifier.group.itemLinks.some((link) => link.menuItemId === mi.id)) {
+          throw new BadRequestException(`Modifier ${modifierId} is not valid for item ${mi.id}`);
+        }
+        return { name: modifier.name, priceDelta: modifier.priceDelta };
+      });
       return {
         menuItemId: mi.id,
         name: mi.name,
         unitPrice: ov?.price ?? mi.basePrice,
         quantity: i.quantity,
         notes: i.notes,
-        modifiers: i.modifiers || [],
+        modifiers: resolvedModifiers,
         stationId: mi.stationId || undefined,
       };
     });
@@ -123,9 +152,7 @@ export class OrdersService {
     // resolve customer by phone for loyalty if needed
     let customerId = dto.customerId;
     if (!customerId && dto.customerPhone) {
-      const c = await this.prisma.customer.findFirst({
-        where: { phone: { contains: dto.customerPhone.replace(/\s/g, '') } },
-      });
+      const c = await this.loyalty.findCustomerByPhone(dto.customerPhone, branch.organizationId);
       customerId = c?.id;
     }
 
@@ -168,8 +195,8 @@ export class OrdersService {
 
     const orderNumber = await this.nextOrderNumber(branch.id);
     const publicToken = randomBytes(16).toString('hex');
-    const type = (dto.type as any) || (dto.tableSessionId ? 'DINE_IN_QR' : 'TAKEAWAY_POS');
-    const initialStatus: OrderStatus = dto.skipPayment ? 'NEW' : 'AWAITING_PAYMENT';
+    const type: OrderType = (dto.type as OrderType) || (dto.tableSessionId ? 'DINE_IN_QR' : 'TAKEAWAY_POS');
+    const initialStatus: OrderStatus = options.skipPayment ? 'NEW' : 'AWAITING_PAYMENT';
 
     const order = await this.prisma.$transaction(async (tx) => {
       const o = await tx.order.create({
@@ -259,7 +286,7 @@ export class OrdersService {
         tx as any,
       );
 
-      if (dto.skipPayment) {
+      if (options.skipPayment) {
         await this.outbox.publish(
           'ORDER_STATUS_CHANGED',
           'order',
@@ -272,7 +299,7 @@ export class OrdersService {
       return o;
     });
 
-    if (dto.skipPayment) {
+    if (options.skipPayment) {
       await this.kitchen.createTicketsForOrder(order.id);
       return order;
     }
@@ -353,6 +380,10 @@ export class OrdersService {
         { orderId: id, from: order.status, to: toStatus, branchId: order.branchId },
         tx as any,
       );
+      if (toStatus === 'CANCELLED') {
+        await this.vouchers.release(id, tx as any);
+        await this.loyalty.restoreRedeem(id, tx as any);
+      }
       return o;
     });
 
@@ -441,14 +472,40 @@ export class OrdersService {
     if (!item) throw new NotFoundException('Item not found');
 
     await this.prisma.$transaction(async (tx) => {
+      await tx.kitchenTicketItem.deleteMany({ where: { orderItemId } });
       await tx.orderItem.delete({ where: { id: orderItemId } });
+      await tx.kitchenTicket.deleteMany({ where: { orderId, items: { none: {} } } });
       const remaining = await tx.orderItem.findMany({ where: { orderId } });
-      const subtotal = remaining.reduce((s, i) => s + i.lineTotal, 0);
+      const branch = await tx.branch.findUniqueOrThrow({ where: { id: order.branchId } });
+      const priced = this.pricing.calculate({
+        lines: remaining.map((i) => ({
+          name: i.nameSnapshot,
+          unitPrice: i.unitPrice,
+          quantity: i.quantity,
+        })),
+        taxBps: branch.taxBps,
+        serviceChargeBps: branch.serviceChargeBps,
+        tipAmount: order.tipTotal,
+        orderDiscount: order.discountTotal,
+      });
+      await tx.orderPriceComponent.deleteMany({ where: { orderId } });
+      await tx.orderPriceComponent.createMany({
+        data: priced.components.map((component) => ({
+          orderId,
+          type: component.type,
+          label: component.label,
+          amount: component.amount,
+          meta: component.meta as Prisma.InputJsonValue,
+        })),
+      });
       await tx.order.update({
         where: { id: orderId },
         data: {
-          subtotal,
-          grandTotal: Math.max(0, order.grandTotal - item.lineTotal),
+          subtotal: priced.subtotal,
+          discountTotal: priced.itemDiscount + priced.orderDiscount,
+          taxTotal: priced.taxTotal,
+          serviceChargeTotal: priced.serviceChargeTotal,
+          grandTotal: priced.grandTotal,
         },
       });
       await tx.orderStatusHistory.create({
@@ -470,22 +527,28 @@ export class OrdersService {
     if (!table || table.branchId !== order.branchId) {
       throw new BadRequestException('Table not in same branch');
     }
-    await this.prisma.order.update({
-      where: { id: orderId },
-      data: { tableId },
-    });
-    if (order.tableSessionId) {
-      await this.prisma.tableSession.update({
-        where: { id: order.tableSessionId },
-        data: { tableId },
-      }).catch(() => undefined);
+    if (table.id !== order.tableId && table.status !== 'AVAILABLE') {
+      throw new BadRequestException('Target table unavailable');
     }
-    await this.outbox.publish('ORDER_STATUS_CHANGED', 'order', orderId, {
-      orderId,
-      branchId: order.branchId,
-      to: 'TABLE_TRANSFERRED',
-      tableId,
-      actorId,
+    await this.prisma.$transaction(async (tx) => {
+      await tx.order.update({ where: { id: orderId }, data: { tableId } });
+      if (order.tableSessionId) {
+        await tx.tableSession.update({ where: { id: order.tableSessionId }, data: { tableId } });
+      }
+      await tx.cafeTable.update({ where: { id: tableId }, data: { status: 'OCCUPIED' } });
+      if (order.tableId && order.tableId !== tableId) {
+        const other = await tx.tableSession.count({
+          where: {
+            tableId: order.tableId,
+            id: order.tableSessionId ? { not: order.tableSessionId } : undefined,
+            status: { in: ['OPEN', 'ACTIVE', 'CHECKOUT_IN_PROGRESS', 'CLOSING'] },
+          },
+        });
+        if (!other) await tx.cafeTable.update({ where: { id: order.tableId }, data: { status: 'AVAILABLE' } });
+      }
+      await this.outbox.publish('ORDER_STATUS_CHANGED', 'order', orderId, {
+        orderId, branchId: order.branchId, to: 'TABLE_TRANSFERRED', tableId, actorId,
+      }, tx as any);
     });
     return this.get(orderId);
   }
@@ -517,6 +580,9 @@ export class OrdersService {
     if (!src || !tgt || src.branchId !== tgt.branchId) {
       throw new BadRequestException('Invalid sessions');
     }
+    if (['CLOSED', 'CANCELLED'].includes(src.status) || ['CLOSED', 'CANCELLED'].includes(tgt.status)) {
+      throw new BadRequestException('Session closed');
+    }
     await this.prisma.$transaction(async (tx) => {
       await tx.order.updateMany({
         where: { tableSessionId: sourceSessionId },
@@ -524,7 +590,7 @@ export class OrdersService {
       });
       await tx.tableSession.update({
         where: { id: sourceSessionId },
-        data: { status: 'CLOSED' },
+        data: { status: 'CLOSED', closedAt: new Date() },
       });
       await tx.tableSession.update({
         where: { id: targetSessionId },
@@ -532,6 +598,10 @@ export class OrdersService {
           totalSpending: { increment: src.totalSpending || 0 },
         },
       });
+      await tx.cafeTable.update({ where: { id: tgt.tableId }, data: { status: 'OCCUPIED' } });
+      if (src.tableId !== tgt.tableId) {
+        await tx.cafeTable.update({ where: { id: src.tableId }, data: { status: 'AVAILABLE' } });
+      }
     });
     return { merged: true, targetSessionId, actorId };
   }

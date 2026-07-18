@@ -1,29 +1,60 @@
 import { NestFactory } from '@nestjs/core';
-import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
+import { ExpressAdapter } from '@nestjs/platform-express';
 import { ValidationPipe } from '@nestjs/common';
+import express, { type Express, type Request, type Response } from 'express';
 import { AppModule } from '../src/app.module';
 
-let app: NestFastifyApplication;
+let cached: Express | null = null;
+let boot: Promise<Express> | null = null;
 
-async function getApp() {
-  if (!app) {
-    app = await NestFactory.create<NestFastifyApplication>(
-      AppModule,
-      new FastifyAdapter({ logger: false }),
-    );
-    app.enableCors({ origin: true, credentials: true });
+async function getServer(): Promise<Express> {
+  if (cached) return cached;
+  if (boot) return boot;
+
+  boot = (async () => {
+    const server = express();
+    const adapter = new ExpressAdapter(server);
+    const app = await NestFactory.create(AppModule, adapter, {
+      logger: ['error', 'warn', 'log'],
+    });
+
+    const origins = (process.env.CORS_ORIGINS || '*')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    app.enableCors({
+      origin: origins.includes('*') ? true : origins,
+      credentials: true,
+    });
     app.setGlobalPrefix('api/v1');
     app.useGlobalPipes(
-      new ValidationPipe({ whitelist: true, transform: true }),
+      new ValidationPipe({
+        whitelist: true,
+        transform: true,
+        transformOptions: { enableImplicitConversion: true },
+      }),
     );
+
     await app.init();
-    await app.getHttpAdapter().getInstance().ready();
-  }
-  return app;
+    cached = server;
+    return server;
+  })();
+
+  return boot;
 }
 
-export default async function handler(req: any, res: any) {
-  const nestApp = await getApp();
-  const instance = nestApp.getHttpAdapter().getInstance();
-  instance.server.emit('request', req, res);
+export default async function handler(req: Request, res: Response) {
+  try {
+    const server = await getServer();
+    return server(req, res);
+  } catch (err: any) {
+    console.error('bootstrap failed', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        message: 'Internal Server Error',
+        error: String(err?.message || err),
+      });
+    }
+  }
 }

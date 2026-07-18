@@ -4,6 +4,7 @@ import { AuthUser } from '../common/types';
 import { assertBranchAccess } from '../common/tenant';
 import { ReservationsService } from './reservations.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { ReservationStatus } from '@prisma/client';
 
 @Controller()
 export class ReservationsController {
@@ -42,7 +43,7 @@ export class ReservationsController {
   @RequirePermissions('reservation.manage')
   async status(
     @Param('id') id: string,
-    @Body() body: { status: string },
+    @Body() body: { status: ReservationStatus },
     @CurrentUser() user: AuthUser,
   ) {
     const r = await this.prisma.reservation.findUnique({ where: { id } });
@@ -66,7 +67,7 @@ export class ReservationsController {
   async confirmDeposit(@CurrentUser() user: AuthUser, @Param('id') id: string) {
     const r = await this.prisma.reservation.findUnique({ where: { id } });
     if (r) await assertBranchAccess(this.prisma, user, r.branchId);
-    return this.service.confirmDeposit(id);
+    return this.service.confirmDeposit(id, user.id);
   }
 
   @Post('reservations/:id/no-show')

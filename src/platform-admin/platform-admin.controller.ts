@@ -63,13 +63,13 @@ export class PlatformAdminController {
     @Body() body: { organizationId: string; amount: number },
     @CurrentUser() user: AuthUser,
   ) {
-    return this.payouts.createBatch(body.organizationId, body.amount, user.id);
+    return this.payouts.createBatch(body.organizationId, body.amount, user);
   }
 
   @Post('payout-batches/:id/approve')
   @RequirePermissions('payout.manage')
   approve(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.payouts.approve(id, user.id);
+    return this.payouts.approve(id, user);
   }
 
   @Post('ledger-adjustments')
@@ -90,6 +90,6 @@ export class PlatformAdminController {
   @Post('payout-batches/:id/submit')
   @RequirePermissions('payout.manage')
   submitPayout(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    return this.payouts.submitApproval(id, user.id);
+    return this.payouts.submitApproval(id, user);
   }
 }

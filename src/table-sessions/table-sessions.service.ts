@@ -30,13 +30,21 @@ export class TableSessionsService {
 
     if (existing) {
       if (dto.joinExisting !== false) {
-        await this.prisma.tableSessionParticipant.create({
-          data: {
+        const participant = await this.prisma.tableSessionParticipant.findFirst({
+          where: {
             tableSessionId: existing.id,
-            customerId: dto.customerId,
-            displayName: dto.displayName,
+            ...(dto.customerId ? { customerId: dto.customerId } : { displayName: dto.displayName || 'Guest' }),
           },
         });
+        if (!participant) {
+          await this.prisma.tableSessionParticipant.create({
+            data: {
+              tableSessionId: existing.id,
+              customerId: dto.customerId,
+              displayName: dto.displayName || 'Guest',
+            },
+          });
+        }
         return this.prisma.tableSession.findUnique({
           where: { id: existing.id },
           include: { participants: true, table: true },

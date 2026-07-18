@@ -50,12 +50,24 @@ export class HomepageService {
     });
   }
 
-  async updateDraft(pageId: string, dto: { design?: object; sections?: any[] }) {
+  async updateDraft(
+    pageId: string,
+    dto: { design?: object; seo?: { title?: string; description?: string }; sections?: any[] },
+  ) {
     const page = await this.prisma.homepagePage.findUnique({
       where: { id: pageId },
       include: { versions: { orderBy: { version: 'desc' }, take: 1 } },
     });
     if (!page) throw new NotFoundException();
+    if (dto.seo) {
+      await this.prisma.homepagePage.update({
+        where: { id: pageId },
+        data: {
+          seoTitle: dto.seo.title?.trim() || null,
+          seoDescription: dto.seo.description?.trim() || null,
+        },
+      });
+    }
     let version = page.versions[0];
     if (!version || version.status === 'PUBLISHED') {
       version = await this.prisma.homepageVersion.create({
@@ -218,7 +230,14 @@ export class HomepageService {
   list(organizationId: string) {
     return this.prisma.homepagePage.findMany({
       where: { organizationId },
-      include: { versions: { orderBy: { version: 'desc' }, take: 3 } },
+      include: {
+        versions: {
+          orderBy: { version: 'desc' },
+          take: 3,
+          include: { sections: { orderBy: { sortOrder: 'asc' } } },
+        },
+      },
+      orderBy: { updatedAt: 'desc' },
     });
   }
 }

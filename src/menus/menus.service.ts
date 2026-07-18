@@ -9,9 +9,10 @@ export class MenusService {
     return this.prisma.menu.create({ data: dto });
   }
 
-  listMenus(brandId?: string, branchId?: string) {
+  listMenus(organizationId: string, brandId?: string, branchId?: string) {
     return this.prisma.menu.findMany({
       where: {
+        brand: { organizationId },
         ...(brandId ? { brandId } : {}),
         ...(branchId ? { branchId } : {}),
       },
@@ -161,9 +162,14 @@ export class MenusService {
     };
   }
 
-  createModifierGroup(name: string, opts?: { required?: boolean; minSelect?: number; maxSelect?: number }) {
+  createModifierGroup(
+    organizationId: string,
+    name: string,
+    opts?: { required?: boolean; minSelect?: number; maxSelect?: number },
+  ) {
     return this.prisma.modifierGroup.create({
       data: {
+        organizationId,
         name,
         required: opts?.required ?? false,
         minSelect: opts?.minSelect ?? 0,

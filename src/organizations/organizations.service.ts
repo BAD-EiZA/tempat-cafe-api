@@ -216,20 +216,22 @@ export class OrganizationsService {
     actorId: string,
     dto: { email: string; name?: string; roleCode?: string },
   ) {
+    const email = dto.email.trim().toLowerCase();
+    if (!email) throw new BadRequestException('Email is required');
     const role = await this.prisma.role.findUnique({
       where: { code: dto.roleCode || 'CASHIER' },
     });
     if (!role) throw new BadRequestException('Role not found');
 
     let user = await this.prisma.user.findFirst({
-      where: { email: dto.email },
+      where: { email: { equals: email, mode: 'insensitive' } },
     });
     if (!user) {
       user = await this.prisma.user.create({
         data: {
-          kindeId: `invite-${dto.email.toLowerCase()}`,
-          email: dto.email,
-          name: dto.name || dto.email.split('@')[0],
+          kindeId: `invite-${email}`,
+          email,
+          name: dto.name || email.split('@')[0],
         },
       });
     }

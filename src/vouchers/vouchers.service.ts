@@ -118,4 +118,12 @@ export class VouchersService {
       data: { voucherId, orderId, amount },
     });
   }
+
+  release(orderId: string, tx?: Tx) {
+    const client = tx || this.prisma;
+    return client.voucherReservation.updateMany({
+      where: { orderId, status: 'RESERVED' },
+      data: { status: 'RELEASED' },
+    });
+  }
 }

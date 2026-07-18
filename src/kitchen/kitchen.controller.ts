@@ -4,6 +4,7 @@ import { AuthUser } from '../common/types';
 import { assertBranchAccess } from '../common/tenant';
 import { KitchenService } from './kitchen.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { KitchenTicketStatus } from '@prisma/client';
 
 @Controller('kitchen')
 export class KitchenController {
@@ -32,6 +33,6 @@ export class KitchenController {
   ) {
     const t = await this.prisma.kitchenTicket.findUnique({ where: { id } });
     if (t) await assertBranchAccess(this.prisma, user, t.branchId);
-    return this.service.updateTicketStatus(id, body.status);
+    return this.service.updateTicketStatus(id, body.status as KitchenTicketStatus);
   }
 }

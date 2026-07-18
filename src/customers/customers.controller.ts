@@ -19,8 +19,8 @@ export class CustomersController {
 
   @Get(':id')
   @RequirePermissions('merchant.read')
-  get(@Param('id') id: string) {
-    return this.service.get(id);
+  get(@CurrentUser() user: AuthUser, @Param('id') id: string, @Query('organizationId') organizationId?: string) {
+    return this.service.get(id, pickOrgId(user, organizationId));
   }
 
   @Post('me')

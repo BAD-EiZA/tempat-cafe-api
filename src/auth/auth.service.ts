@@ -1,39 +1,55 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createRemoteJWKSet, jwtVerify, JWTPayload } from 'jose';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUser } from '../common/types';
 
+type JwtPayload = Record<string, unknown> & { sub?: string };
+
 @Injectable()
 export class AuthService {
-  private jwks: ReturnType<typeof createRemoteJWKSet> | null = null;
+  private jwks: any = null;
+  private joseMod: any = null;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
   ) {}
 
-  private getJwks() {
+  /** Dynamic import — jose is ESM-only; Nest/Vercel compile to CJS. */
+  private async jose() {
+    if (!this.joseMod) {
+      this.joseMod = await import('jose');
+    }
+    return this.joseMod;
+  }
+
+  private async getJwks() {
     if (!this.jwks) {
-      const domain = this.config.get<string>('KINDE_DOMAIN') || this.config.get<string>('KINDE_ISSUER');
+      const { createRemoteJWKSet } = await this.jose();
+      const domain =
+        this.config.get<string>('KINDE_DOMAIN') ||
+        this.config.get<string>('KINDE_ISSUER');
       if (!domain) throw new UnauthorizedException('Kinde not configured');
-      this.jwks = createRemoteJWKSet(new URL(`${domain.replace(/\/$/, '')}/.well-known/jwks.json`));
+      this.jwks = createRemoteJWKSet(
+        new URL(`${domain.replace(/\/$/, '')}/.well-known/jwks.json`),
+      );
     }
     return this.jwks;
   }
 
-  async verifyToken(token: string): Promise<JWTPayload> {
-    const issuer = this.config.get<string>('KINDE_ISSUER') || this.config.get<string>('KINDE_DOMAIN');
+  async verifyToken(token: string): Promise<JwtPayload> {
+    const issuer =
+      this.config.get<string>('KINDE_ISSUER') ||
+      this.config.get<string>('KINDE_DOMAIN');
     const audience = this.config.get<string>('KINDE_AUDIENCE');
     try {
-      const { payload } = await jwtVerify(token, this.getJwks(), {
+      const { jwtVerify } = await this.jose();
+      const { payload } = await jwtVerify(token, await this.getJwks(), {
         issuer: issuer?.replace(/\/$/, ''),
         audience: audience || undefined,
       });
-      return payload;
+      return payload as JwtPayload;
     } catch {
-      // Dev fallback: accept unsigned mock tokens when Kinde not set
-      // Dev mock JWT only when ALLOW_DEV_AUTH=true and not production
       const allowDev =
         this.config.get('NODE_ENV') !== 'production' &&
         this.config.get('ALLOW_DEV_AUTH') === 'true';
@@ -46,7 +62,16 @@ export class AuthService {
               'base64',
             ).toString('utf8');
             const payload = JSON.parse(json);
-            if (payload?.sub) return payload;
+            const now = Math.floor(Date.now() / 1000);
+            if (
+              payload &&
+              typeof payload === 'object' &&
+              typeof payload.sub === 'string' &&
+              payload.sub &&
+              (payload.exp == null || (typeof payload.exp === 'number' && payload.exp > now))
+            ) {
+              return payload;
+            }
           }
         } catch {
           /* ignore */
@@ -56,14 +81,13 @@ export class AuthService {
     }
   }
 
-  async resolveUser(payload: JWTPayload): Promise<AuthUser> {
+  async resolveUser(payload: JwtPayload): Promise<AuthUser> {
     const kindeId = String(payload.sub || '');
     if (!kindeId) throw new UnauthorizedException('Missing sub');
 
-    const email =
-      (payload.email as string) ||
-      (payload.preferred_username as string) ||
-      null;
+    const emailClaim =
+      (payload.email as string) || (payload.preferred_username as string) || '';
+    const email = emailClaim.trim().toLowerCase() || null;
     const name =
       (payload.name as string) ||
       [payload.given_name, payload.family_name].filter(Boolean).join(' ') ||
@@ -71,8 +95,20 @@ export class AuthService {
 
     let user = await this.prisma.user.findUnique({ where: { kindeId } });
     if (!user) {
-      user = await this.prisma.user.create({
-        data: { kindeId, email, name },
+      user = await this.prisma.$transaction(async (tx) => {
+        const existing = await tx.user.findUnique({ where: { kindeId } });
+        if (existing) return existing;
+
+        const invitation = email
+          ? await tx.user.findUnique({ where: { kindeId: `invite-${email}` } })
+          : null;
+        if (invitation) {
+          return tx.user.update({
+            where: { id: invitation.id },
+            data: { kindeId, email, name: name || invitation.name },
+          });
+        }
+        return tx.user.create({ data: { kindeId, email, name } });
       });
     } else if (!user.isActive) {
       throw new UnauthorizedException('User suspended');
@@ -107,7 +143,6 @@ export class AuthService {
       }
     }
 
-    // Platform super admin by permission on any role
     return {
       id: user.id,
       kindeId: user.kindeId,

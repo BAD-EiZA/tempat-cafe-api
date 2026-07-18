@@ -1,8 +1,10 @@
-import { Injectable, Inject, forwardRef } from '@nestjs/common';
+import { BadRequestException, Injectable, Inject, forwardRef, NotFoundException } from '@nestjs/common';
+import { KitchenTicketStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { OutboxService } from '../outbox/outbox.service';
 import { PrintersService } from '../printers/printers.service';
 import { OrdersService } from '../orders/orders.service';
+import { canTransitionKitchenTicket } from '../common/transaction-integrity';
 
 @Injectable()
 export class KitchenService {
@@ -38,7 +40,10 @@ export class KitchenService {
 
     const tickets: any[] = [];
     for (const [stationId, items] of byStation) {
-      const ticket = await this.prisma.kitchenTicket.create({
+      let created = true;
+      let ticket;
+      try {
+        ticket = await this.prisma.kitchenTicket.create({
         data: {
           orderId,
           stationId,
@@ -54,19 +59,27 @@ export class KitchenService {
           },
         },
         include: { items: true, station: true },
-      });
+        });
+      } catch (error) {
+        if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') throw error;
+        created = false;
+        ticket = await this.prisma.kitchenTicket.findUniqueOrThrow({
+          where: { orderId_stationId: { orderId, stationId } },
+          include: { items: true, station: true },
+        });
+      }
       tickets.push(ticket);
-      await this.outbox.publish('KITCHEN_TICKET_CREATED', 'kitchen_ticket', ticket.id, {
+      if (created) await this.outbox.publish('KITCHEN_TICKET_CREATED', 'kitchen_ticket', ticket.id, {
         ticketId: ticket.id,
         orderId,
         stationId,
         branchId: order.branchId,
       });
-      await this.printers.enqueueForTicket(ticket.id);
+      if (created) await this.printers.enqueueForTicket(ticket.id);
     }
 
-    await this.prisma.order.update({
-      where: { id: orderId },
+    await this.prisma.order.updateMany({
+      where: { id: orderId, status: { in: ['NEW', 'ACCEPTED'] } },
       data: { status: 'PREPARING' },
     }).catch(() => undefined);
 
@@ -85,7 +98,13 @@ export class KitchenService {
     });
   }
 
-  async updateTicketStatus(id: string, status: any) {
+  async updateTicketStatus(id: string, status: KitchenTicketStatus) {
+    const current = await this.prisma.kitchenTicket.findUnique({ where: { id } });
+    if (!current) throw new NotFoundException('Kitchen ticket not found');
+    if (!Object.values(KitchenTicketStatus).includes(status)) throw new BadRequestException('Invalid kitchen status');
+    if (!canTransitionKitchenTicket(current.status, status)) {
+      throw new BadRequestException(`Cannot transition ${current.status} to ${status}`);
+    }
     const ticket = await this.prisma.kitchenTicket.update({
       where: { id },
       data: {

@@ -1,0 +1,28 @@
+import { PrismaService } from '../prisma/prisma.service';
+import { AuthUser } from './types';
+export declare function isPlatformAdmin(user: AuthUser): boolean;
+export declare function assertOrgAccess(user: AuthUser, organizationId?: string | null): void;
+export declare function pickOrgId(user: AuthUser, requested?: string | null, header?: string | null): string;
+export declare function assertBranchAccess(prisma: PrismaService, user: AuthUser, branchId?: string | null): Promise<{
+    name: string;
+    id: string;
+    phone: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+    organizationId: string;
+    slug: string;
+    address: string | null;
+    status: import(".prisma/client").$Enums.BranchStatus;
+    brandId: string;
+    latitude: number | null;
+    longitude: number | null;
+    timezone: string;
+    whatsapp: string | null;
+    taxBps: number;
+    serviceChargeBps: number;
+    minOrderAmount: number | null;
+    paymentTimeoutSec: number;
+    settings: import("@prisma/client/runtime/library").JsonValue | null;
+    deletedAt: Date | null;
+} | null>;
+export declare function orgIdFromBranch(prisma: PrismaService, branchId: string): Promise<string>;

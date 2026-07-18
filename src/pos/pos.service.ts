@@ -26,8 +26,7 @@ export class PosService {
     return this.orders.checkout({
       ...dto,
       type: dto.type || 'DINE_IN_POS',
-      skipPayment: dto.paymentMethod === 'CASH',
-    });
+    }, { skipPayment: dto.paymentMethod === 'CASH' });
   }
 
   openShift(branchId: string, userId: string, openingCash: number) {

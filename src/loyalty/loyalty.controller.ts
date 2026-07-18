@@ -1,7 +1,10 @@
 import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
-import { Public, RequirePermissions } from '../common/decorators';
+import { CurrentUser, Public, RequirePermissions } from '../common/decorators';
 import { LoyaltyService } from './loyalty.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { AuthUser } from '../common/types';
+import { assertOrgAccess } from '../common/tenant';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 
 @Controller('loyalty')
 export class LoyaltyController {
@@ -10,9 +13,17 @@ export class LoyaltyController {
     private readonly prisma: PrismaService,
   ) {}
 
+  private async assertAccountAccess(user: AuthUser, accountId: string) {
+    const account = await this.prisma.loyaltyAccount.findUnique({ where: { id: accountId } });
+    if (!account) throw new NotFoundException('Loyalty account not found');
+    assertOrgAccess(user, account.organizationId);
+    return account;
+  }
+
   @Get('accounts/:id')
   @RequirePermissions('merchant.read')
-  get(@Param('id') id: string) {
+  async get(@CurrentUser() user: AuthUser, @Param('id') id: string) {
+    await this.assertAccountAccess(user, id);
     return this.service.getAccount(id);
   }
 
@@ -26,9 +37,7 @@ export class LoyaltyController {
     if (!organizationId) return null;
     let cid = customerId;
     if (!cid && phone) {
-      const c = await this.prisma.customer.findFirst({
-        where: { phone: { contains: phone.replace(/\s/g, '') } },
-      });
+      const c = await this.service.findCustomerByPhone(phone, organizationId);
       cid = c?.id;
     }
     if (!cid) return { balance: 0 };

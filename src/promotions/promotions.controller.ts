@@ -3,6 +3,7 @@ import { CurrentUser, RequirePermissions } from '../common/decorators';
 import { AuthUser } from '../common/types';
 import { pickOrgId } from '../common/tenant';
 import { PromotionsService } from './promotions.service';
+import { CreatePromotionDto } from './promotion.dto';
 
 @Controller('promotions')
 export class PromotionsController {
@@ -16,7 +17,7 @@ export class PromotionsController {
 
   @Post()
   @RequirePermissions('menu.manage')
-  create(@CurrentUser() user: AuthUser, @Body() body: any) {
+  create(@CurrentUser() user: AuthUser, @Body() body: CreatePromotionDto) {
     body.organizationId = pickOrgId(user, body.organizationId);
     return this.service.create(body);
   }
